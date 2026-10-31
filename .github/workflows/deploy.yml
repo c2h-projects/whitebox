@@ -1,0 +1,94 @@
+name: Deploy to DirectAdmin
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+      # Tech branches only (<gitHandle>/<topic>, topic may nest). Anything
+      # without a slash is somebody's scratch branch and must not deploy.
+      - '*/**'
+
+# One deploy at a time per branch: two quick pushes would otherwise race and
+# interleave their uploads into the same directory.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build static site
+        run: npm run build
+
+      - name: Resolve deploy target
+        id: target
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          case "$BRANCH" in
+            main)
+              echo "dir=/whiteboxexpress.net/public_html/" >> "$GITHUB_OUTPUT"
+              echo "url=https://whiteboxexpress.net" >> "$GITHUB_OUTPUT"
+              ;;
+            staging)
+              echo "dir=/whiteboxexpress.net/public_html/staging/" >> "$GITHUB_OUTPUT"
+              echo "url=https://staging.whiteboxexpress.net" >> "$GITHUB_OUTPUT"
+              ;;
+            */*)
+              HANDLE="${BRANCH%%/*}"
+              echo "dir=/whiteboxexpress--${HANDLE}.cloudtobuild.dev/public_html/" >> "$GITHUB_OUTPUT"
+              echo "url=https://whiteboxexpress--${HANDLE}.cloudtobuild.dev" >> "$GITHUB_OUTPUT"
+              echo "preview=yes" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "No deploy target for '$BRANCH' — build only."
+              ;;
+          esac
+
+      # Everything that is not production is a copy of the client's site on a
+      # host they do not own. Search engines must never index one.
+      - name: Block indexing on non-production targets
+        if: steps.target.outputs.dir != '' && github.ref != 'refs/heads/main'
+        run: |
+          printf 'Header always set X-Robots-Tag "noindex, nofollow"\n' > ./out/.htaccess
+
+      # Previews live in the shared preview account, production and staging in
+      # the client's — different DirectAdmin accounts, so different credentials.
+      # One step each, selected by whether the branch resolved to a preview.
+      - name: Deploy to the client account
+        if: steps.target.outputs.dir != '' && steps.target.outputs.preview != 'yes'
+        uses: SamKirkland/FTP-Deploy-Action@8e83cea8672e3fbcbb9fdafff34debf6ae4c5f65 # v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./out/
+          server-dir: ${{ steps.target.outputs.dir }}
+
+      - name: Deploy to the preview account
+        if: steps.target.outputs.preview == 'yes'
+        uses: SamKirkland/FTP-Deploy-Action@8e83cea8672e3fbcbb9fdafff34debf6ae4c5f65 # v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.PREVIEW_FTP_USERNAME }}
+          password: ${{ secrets.PREVIEW_FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./out/
+          server-dir: ${{ steps.target.outputs.dir }}
+
+      - name: Summary
+        if: steps.target.outputs.url != ''
+        run: echo "Deployed to ${{ steps.target.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
